@@ -1,6 +1,8 @@
 {
-  "short_name": "React App",
-  "name": "Create React App Sample",
+  "short_name": "Voice Pay",
+  "name": "बोलो और भेजो · Voice UPI",
+  "description": "Send money by voice in Hindi, Hinglish, or English",
+  "lang": "hi",
   "icons": [
     {
       "src": "favicon.ico",
@@ -10,16 +12,21 @@
     {
       "src": "logo192.png",
       "type": "image/png",
-      "sizes": "192x192"
+      "sizes": "192x192",
+      "purpose": "any maskable"
     },
     {
       "src": "logo512.png",
       "type": "image/png",
-      "sizes": "512x512"
+      "sizes": "512x512",
+      "purpose": "any maskable"
     }
   ],
   "start_url": ".",
+  "scope": ".",
   "display": "standalone",
-  "theme_color": "#000000",
-  "background_color": "#ffffff"
+  "orientation": "portrait",
+  "theme_color": "#0A0A0F",
+  "background_color": "#0A0A0F",
+  "categories": ["finance", "utilities"]
 }
