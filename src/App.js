@@ -145,7 +145,13 @@ function parseIntent(text, contacts) {
   for (const [word,val] of Object.entries(numWords).sort((a,b)=>b[0].length-a[0].length)) {
     if (t.includes(word)) { amount=val; break; }
   }
-  if (!amount) { const m=t.match(/\b(\d+(?:\.\d+)?)\b/); if(m) amount=parseFloat(m[1]); }
+  if (!amount) {
+    // Match Western digits (50, 500) and Devanagari digits (५०, ५००)
+    const devanagariToWestern = s => s.replace(/[०-९]/g, d => d.charCodeAt(0) - 0x0966);
+    const normalised = devanagariToWestern(t);
+    const m = normalised.match(/\b(\d+(?:\.\d+)?)\b/);
+    if (m) amount = parseFloat(m[1]);
+  }
 
   const tokens=text.split(/\s+/);
   let matchedContact=null, bestScore=0;
@@ -486,8 +492,11 @@ export default function VoicePayment() {
       return;
     }
     const r=new SR();
-    // hi-IN picks up English names naturally; web speech API handles code-switching well
-    r.lang="hi-IN";
+    // iOS Safari with hi-IN transcribes numbers as Devanagari words ("ये", "पचास")
+    // which then fail amount parsing. en-IN on iOS keeps numbers as digits ("50", "100")
+    // while still recognising Hindi names and Hinglish phrases perfectly.
+    // Android hi-IN is fine — it code-switches and produces digits already.
+    r.lang = IS_IOS ? "en-IN" : "hi-IN";
     r.interimResults=true;
     r.continuous=false;
     r.maxAlternatives=3;
@@ -624,11 +633,11 @@ export default function VoicePayment() {
             </div>
           )}
 
-          {/* App preference reminder on iOS if not set */}
-          {IS_IOS&&preferredApp==="phonepe"&&(
-            <div style={{width:"100%",marginBottom:"14px",background:"rgba(255,255,255,.03)",border:"1px solid rgba(255,255,255,.08)",borderRadius:"10px",padding:"10px 14px",fontSize:"12px",color:"#555",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
-              <span>Opens in: <strong style={{color:"#888"}}>{UPI_APPS.find(a=>a.id===preferredApp)?.label}</strong></span>
-              <button onClick={()=>setScreen("settings")} style={{background:"none",border:"1px solid rgba(255,107,53,.3)",color:"#FF6B35",borderRadius:"8px",padding:"4px 10px",fontSize:"11px",cursor:"pointer"}}>Change</button>
+          {/* iOS always shows which app will open (compact, unobtrusive) */}
+          {IS_IOS&&(
+            <div style={{width:"100%",marginBottom:"14px",background:"rgba(255,255,255,.02)",border:"1px solid rgba(255,255,255,.06)",borderRadius:"10px",padding:"8px 14px",fontSize:"12px",color:"#444",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+              <span>Opens in: <strong style={{color:"#666"}}>{UPI_APPS.find(a=>a.id===preferredApp)?.label||"PhonePe"}</strong></span>
+              <button onClick={()=>setScreen("settings")} style={{background:"none",border:"none",color:"#FF6B35",fontSize:"11px",cursor:"pointer",padding:"2px 0"}}>Change ›</button>
             </div>
           )}
 
