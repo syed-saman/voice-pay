@@ -603,7 +603,7 @@ export default function VoicePayment() {
 
       {/* Header + tabs */}
       <div style={{width:"100%",maxWidth:"420px",paddingTop:"44px",marginBottom:"20px",position:"relative",zIndex:1}}>
-        <div style={{fontSize:"10px",letterSpacing:"4px",color:"#FF6B35",marginBottom:"8px"}}>VOICE UPI · v0.4</div>
+        <div style={{fontSize:"10px",letterSpacing:"4px",color:"#FF6B35",marginBottom:"8px"}}>VOICE UPI · v0.5</div>
         <h1 style={{fontSize:"28px",fontWeight:"800",margin:"0 0 16px",lineHeight:1}}>बोलो और भेजो</h1>
         <div style={{display:"flex",gap:"6px",overflowX:"auto",paddingBottom:"2px"}}>
           {tabs.map(tab=>(
@@ -780,7 +780,7 @@ export default function VoicePayment() {
       )}
 
       <div style={{marginTop:"32px",fontSize:"11px",color:"#1E1E1E",textAlign:"center"}}>
-        v0.4 · {IS_IOS?"iOS":"Android"} · {useClaudeParser?"CLAUDE":"LOCAL"} PARSER
+        v0.5 · {IS_IOS?"iOS":"Android"} · {useClaudeParser?"CLAUDE":"LOCAL"} PARSER
       </div>
     </div>
   );
