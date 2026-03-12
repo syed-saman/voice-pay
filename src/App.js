@@ -2,7 +2,6 @@ import { useState, useRef, useCallback } from "react";
 
 // ─── Platform detection ────────────────────────────────────────────────────
 const IS_IOS     = /iPad|iPhone|iPod/.test(navigator.userAgent) && !window.MSStream;
-const IS_ANDROID = /Android/.test(navigator.userAgent);
 const HAS_SPEECH = !!(window.SpeechRecognition || window.webkitSpeechRecognition);
 
 // ─── Contacts persistence ──────────────────────────────────────────────────
@@ -39,18 +38,9 @@ const UPI_APPS = [
 ];
 
 function launchUpiApp(params, preferredAppId = "phonepe") {
-  if (IS_ANDROID) {
-    // Hidden anchor = native Android intent chooser, zero Chrome popup
-    const a = document.createElement("a");
-    a.href = `upi://pay?${params}`;
-    a.rel  = "noopener noreferrer";
-    a.style.display = "none";
-    document.body.appendChild(a);
-    a.click();
-    setTimeout(() => document.body.removeChild(a), 500);
-    return;
-  }
-  // iOS / desktop: use app-specific scheme
+  // Use the specific app scheme on BOTH Android and iOS.
+  // Generic upi:// is unreliable on modern Android Chrome (silently fails).
+  // App-specific schemes (phonepe://, tez://, paytmmp://) work on both platforms.
   const app = UPI_APPS.find(a => a.id === preferredAppId) || UPI_APPS[0];
   window.location.href = app.scheme(params);
 }
@@ -339,8 +329,7 @@ function SettingsScreen({claudeKey,setClaudeKey,useClaudeParser,setUseClaudePars
       <div style={{background:"rgba(255,255,255,.03)",border:"1px solid rgba(255,107,53,.2)",borderRadius:"18px",padding:"18px",marginBottom:"16px"}}>
         <div style={{fontSize:"10px",letterSpacing:"3px",color:"#FF6B35",marginBottom:"6px"}}>📱 YOUR UPI APP</div>
         <p style={{fontSize:"13px",color:"#555",lineHeight:"1.5",marginBottom:"14px"}}>
-          {IS_IOS?"iOS needs to know which app to open — pick it once here."
-                 :"On Android, all UPI apps appear automatically. You can still set a preferred one."}
+          Pick your UPI app once — voice payments will open it directly every time.
         </p>
         <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"8px"}}>
           {UPI_APPS.map(app=>(
@@ -350,9 +339,9 @@ function SettingsScreen({claudeKey,setClaudeKey,useClaudeParser,setUseClaudePars
             </button>
           ))}
         </div>
-        {IS_IOS&&<p style={{fontSize:"11px",color:"#444",marginTop:"10px",lineHeight:1.6}}>
-          ⚠️ Make sure the selected app is installed on your iPhone. If payment doesn't open, try a different app above.
-        </p>}
+        <p style={{fontSize:"11px",color:"#444",marginTop:"10px",lineHeight:1.6}}>
+          ⚠️ Make sure this app is installed. If payment doesn't open, try a different app above.
+        </p>
       </div>
 
       {/* Claude API */}
@@ -401,8 +390,12 @@ export default function VoicePayment() {
   // Text input fallback (shown when speech unavailable or user prefers typing)
   const [textMode,setTextMode]=useState(!HAS_SPEECH);
   const [textInput,setTextInput]=useState("");
+  // Editable transcript — shown after STT stops so user can fix before sending
+  const [editableTranscript,setEditableTranscript]=useState("");
+  const [waitingForSend,setWaitingForSend]=useState(false);
 
   const recognitionRef=useRef(null);
+  const listeningRef=useRef(false); // tracks whether mic is active for tap-toggle
 
   const speak=useCallback((text)=>{
     window.speechSynthesis.cancel();
@@ -479,98 +472,123 @@ export default function VoicePayment() {
   },[contacts,speak,addTransaction,useClaudeParser,claudeKey,preferredApp]);
 
   const reset=useCallback(()=>{
+    listeningRef.current=false;
+    try{recognitionRef.current?.abort();}catch(e){}
     setPhase("idle");setTranscript("");setErrorMsg("");setTextInput("");
+    setEditableTranscript("");setWaitingForSend(false);
   },[]);
 
-  // ── Speech recognition — processes as soon as final result arrives ───────
-  const startListening=useCallback(()=>{
+  // ── Tap-to-toggle mic — more reliable than hold on iOS Safari ────────────
+  const toggleListening=useCallback(()=>{
+    if(listeningRef.current){
+      // Second tap: stop and process what we have
+      listeningRef.current=false;
+      try{recognitionRef.current?.stop();}catch(e){}
+      return;
+    }
+
     const SR=window.SpeechRecognition||window.webkitSpeechRecognition;
     if(!SR){
       setTextMode(true);
-      setErrorMsg("Voice not available in this browser. Use the text box below.");
+      setErrorMsg("Voice not available. Use the text box below.");
       setPhase("error");
       return;
     }
+
+    // If currently in error/success, reset first
+    setPhase("idle");setErrorMsg("");setEditableTranscript("");setWaitingForSend(false);
+
     const r=new SR();
-    // iOS Safari with hi-IN transcribes numbers as Devanagari words ("ये", "पचास")
-    // which then fail amount parsing. en-IN on iOS keeps numbers as digits ("50", "100")
-    // while still recognising Hindi names and Hinglish phrases perfectly.
-    // Android hi-IN is fine — it code-switches and produces digits already.
+    // en-IN on iOS: keeps numbers as digits ("50"), hi-IN transcribes as Devanagari ("पचास")
     r.lang = IS_IOS ? "en-IN" : "hi-IN";
     r.interimResults=true;
     r.continuous=false;
     r.maxAlternatives=3;
     recognitionRef.current=r;
+    listeningRef.current=true;
 
     let bestFinal="";
     let interimText="";
     let autoStop=null;
-    let processingStarted=false;
+    let silenceTimer=null; // stop after 2s of no new results
+    let done=false;
 
-    const doProcess=(text)=>{
-      if(processingStarted||!text.trim()) return;
-      processingStarted=true;
+    const finish=(text)=>{
+      if(done) return;
+      done=true;
+      listeningRef.current=false;
       clearTimeout(autoStop);
+      clearTimeout(silenceTimer);
       try{r.abort();}catch(e){}
-      parseAndPay(text);
+      setPulseRings(false);
+
+      const trimmed=(text||"").trim();
+      if(!trimmed){setPhase("idle");return;}
+
+      // Try to parse immediately — if it works, pay straight away
+      const quick=parseIntent(trimmed,contacts);
+      if(quick.intent==="SEND_PAYMENT"){
+        parseAndPay(trimmed);
+      } else {
+        // Show editable transcript so user can fix and tap Send
+        setEditableTranscript(trimmed);
+        setWaitingForSend(true);
+        setTranscript(trimmed);
+        setPhase("idle");
+      }
     };
 
     r.onstart=()=>{
       setPhase("listening");setPulseRings(true);setTranscript("");setErrorMsg("");
-      // Auto-stop after 7 s — if we have interim text, use it (handles "no-speech" situations)
-      autoStop=setTimeout(()=>{
-        if(interimText.trim()) doProcess(interimText);
-        else { try{r.stop();}catch(e){} }
-      },7000);
+      // Hard timeout: 10s max recording
+      autoStop=setTimeout(()=>finish(bestFinal||interimText),10000);
     };
 
     r.onresult=(e)=>{
       const results=Array.from(e.results);
       interimText=results.map(x=>x[0].transcript).join("");
-      // Pick highest-confidence alternative for final results
       const finalText=results.filter(x=>x.isFinal).map(x=>{
         let best=x[0];
         for(let i=1;i<x.length;i++) if(x[i].confidence>best.confidence) best=x[i];
         return best.transcript;
       }).join("");
       if(finalText) bestFinal=finalText;
-
-      // Update live display
       setTranscript(interimText);
 
-      // As soon as we have a final result, check if we can parse already
-      if(finalText&&e.results[e.results.length-1].isFinal){
-        // Quick check: do we already have both a contact and an amount?
-        const quick=parseIntent(bestFinal,contacts);
+      // Reset silence timer on each new result
+      clearTimeout(silenceTimer);
+
+      if(e.results[e.results.length-1].isFinal){
+        // Got a final result — try parse immediately; if good, finish now
+        const quick=parseIntent(bestFinal||finalText,contacts);
         if(quick.intent==="SEND_PAYMENT"){
-          // We have enough — don't wait for more, go immediately
-          doProcess(bestFinal);
+          finish(bestFinal||finalText);
+          return;
         }
+        // Otherwise wait 1.5s for more speech before giving up
+        silenceTimer=setTimeout(()=>finish(bestFinal||interimText),1500);
+      } else {
+        // Still interim — wait 2s of silence before auto-stopping
+        silenceTimer=setTimeout(()=>{try{r.stop();}catch(e){}},2000);
       }
     };
 
     r.onend=()=>{
-      clearTimeout(autoStop);
-      setPulseRings(false);
-      // Use whatever we got — bestFinal if available, else interimText
-      const text=bestFinal||interimText;
-      doProcess(text);
+      clearTimeout(silenceTimer);
+      finish(bestFinal||interimText);
     };
 
     r.onerror=(e)=>{
-      clearTimeout(autoStop);
-      setPulseRings(false);
+      clearTimeout(autoStop);clearTimeout(silenceTimer);
+      setPulseRings(false);listeningRef.current=false;done=true;
       if(e.error==="no-speech"){
-        // Don't show error for no-speech if we have interim text
-        if(interimText.trim()){doProcess(interimText);return;}
-        setPhase("idle"); // silently reset — user just didn't speak
-        return;
+        if(interimText.trim()){finish(interimText);return;}
+        setPhase("idle");return;
       }
-      if(e.error==="aborted") return; // we aborted intentionally
-      processingStarted=true; // prevent double-process in onend
+      if(e.error==="aborted") return;
       setPhase("error");
       const msgs={
-        "not-allowed":"Mic blocked — tap the 🔒 lock icon in your browser and allow microphone access.",
+        "not-allowed":"Mic blocked — tap 🔒 in browser address bar → Allow microphone.",
         "network":"Network error — check your connection.",
         "audio-capture":"No microphone found.",
       };
@@ -579,8 +597,6 @@ export default function VoicePayment() {
 
     r.start();
   },[contacts,parseAndPay]);
-
-  const stopListening=useCallback(()=>{try{recognitionRef.current?.stop();}catch(e){}},[]);
 
   const tabs=[
     {id:"pay",      label:"🎙️ Pay"},
@@ -603,7 +619,7 @@ export default function VoicePayment() {
 
       {/* Header + tabs */}
       <div style={{width:"100%",maxWidth:"420px",paddingTop:"44px",marginBottom:"20px",position:"relative",zIndex:1}}>
-        <div style={{fontSize:"10px",letterSpacing:"4px",color:"#FF6B35",marginBottom:"8px"}}>VOICE UPI · v0.5</div>
+        <div style={{fontSize:"10px",letterSpacing:"4px",color:"#FF6B35",marginBottom:"8px"}}>VOICE UPI · v0.6</div>
         <h1 style={{fontSize:"28px",fontWeight:"800",margin:"0 0 16px",lineHeight:1}}>बोलो और भेजो</h1>
         <div style={{display:"flex",gap:"6px",overflowX:"auto",paddingBottom:"2px"}}>
           {tabs.map(tab=>(
@@ -641,33 +657,57 @@ export default function VoicePayment() {
             </div>
           )}
 
-          {/* Mic button */}
+          {/* Mic button — tap once to start, tap again to stop */}
           {(!textMode||HAS_SPEECH)&&(
-            <div style={{position:"relative",marginBottom:"24px",display:"flex",alignItems:"center",justifyContent:"center"}}>
-              {pulseRings&&[1,2,3].map(i=>(
-                <div key={i} style={{position:"absolute",width:`${90+i*55}px`,height:`${90+i*55}px`,borderRadius:"50%",border:`1px solid rgba(255,107,53,${.5-i*.12})`,animation:`pulse ${.7+i*.25}s ease-out infinite`,animationDelay:`${i*.15}s`}}/>
-              ))}
-              <button
-                onMouseDown={["idle","error","success"].includes(phase)?startListening:undefined}
-                onMouseUp={phase==="listening"?stopListening:undefined}
-                onTouchStart={["idle","error","success"].includes(phase)?startListening:undefined}
-                onTouchEnd={phase==="listening"?stopListening:undefined}
-                style={{width:"96px",height:"96px",borderRadius:"50%",zIndex:10,
-                  background:phase==="listening"?"radial-gradient(circle,#FF6B35,#C93D0A)":phase==="success"?"radial-gradient(circle,#22C55E,#16A34A)":"radial-gradient(circle,#1C1C1C,#111)",
-                  border:phase==="listening"?"2px solid rgba(255,107,53,.9)":phase==="success"?"2px solid rgba(34,197,94,.6)":"2px solid rgba(255,255,255,.07)",
-                  boxShadow:phase==="listening"?"0 0 50px rgba(255,107,53,.5)":phase==="success"?"0 0 40px rgba(34,197,94,.35)":"0 10px 40px rgba(0,0,0,.6)",
-                  cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center",fontSize:"34px",transition:"all .25s ease",WebkitTapHighlightColor:"transparent",
-                  animation:phase==="success"?"pop .4s ease":"none"}}>
-                {["processing","paying"].includes(phase)
-                  ?<div style={{width:"26px",height:"26px",borderRadius:"50%",border:`2px solid ${phase==="paying"?"rgba(34,197,94,.3)":"rgba(255,107,53,.3)"}`,borderTop:`2px solid ${phase==="paying"?"#22C55E":"#FF6B35"}`,animation:"spin .7s linear infinite"}}/>
-                  :phase==="success"?"✓":"🎙️"}
-              </button>
+            <div style={{position:"relative",marginBottom:"16px",display:"flex",flexDirection:"column",alignItems:"center",gap:"10px"}}>
+              <div style={{position:"relative",display:"flex",alignItems:"center",justifyContent:"center"}}>
+                {pulseRings&&[1,2,3].map(i=>(
+                  <div key={i} style={{position:"absolute",width:`${90+i*55}px`,height:`${90+i*55}px`,borderRadius:"50%",border:`1px solid rgba(255,107,53,${.5-i*.12})`,animation:`pulse ${.7+i*.25}s ease-out infinite`,animationDelay:`${i*.15}s`}}/>
+                ))}
+                <button
+                  onClick={["processing","paying"].includes(phase)?undefined:toggleListening}
+                  style={{width:"96px",height:"96px",borderRadius:"50%",zIndex:10,
+                    background:phase==="listening"?"radial-gradient(circle,#FF6B35,#C93D0A)":phase==="success"?"radial-gradient(circle,#22C55E,#16A34A)":"radial-gradient(circle,#1C1C1C,#111)",
+                    border:phase==="listening"?"2px solid rgba(255,107,53,.9)":phase==="success"?"2px solid rgba(34,197,94,.6)":"2px solid rgba(255,255,255,.07)",
+                    boxShadow:phase==="listening"?"0 0 50px rgba(255,107,53,.5)":phase==="success"?"0 0 40px rgba(34,197,94,.35)":"0 10px 40px rgba(0,0,0,.6)",
+                    cursor:["processing","paying"].includes(phase)?"default":"pointer",
+                    display:"flex",alignItems:"center",justifyContent:"center",fontSize:"34px",
+                    transition:"all .25s ease",WebkitTapHighlightColor:"transparent",
+                    animation:phase==="success"?"pop .4s ease":"none"}}>
+                  {["processing","paying"].includes(phase)
+                    ?<div style={{width:"26px",height:"26px",borderRadius:"50%",border:`2px solid ${phase==="paying"?"rgba(34,197,94,.3)":"rgba(255,107,53,.3)"}`,borderTop:`2px solid ${phase==="paying"?"#22C55E":"#FF6B35"}`,animation:"spin .7s linear infinite"}}/>
+                    :phase==="success"?"✓":"🎙️"}
+                </button>
+              </div>
+              {/* Tap hint under button */}
+              <div style={{fontSize:"11px",color:phase==="listening"?"#FF6B35":"#333",transition:"color .2s"}}>
+                {phase==="listening"?"tap to stop":"tap to speak"}
+              </div>
+            </div>
+          )}
+
+          {/* Editable transcript — shown when STT captured text but parse failed */}
+          {waitingForSend&&editableTranscript&&(
+            <div style={{width:"100%",marginBottom:"16px",animation:"fadeUp .25s ease"}}>
+              <div style={{fontSize:"11px",color:"#555",letterSpacing:"2px",marginBottom:"6px"}}>✏️ FIX IF WRONG, THEN SEND</div>
+              <div style={{display:"flex",gap:"8px"}}>
+                <input
+                  value={editableTranscript}
+                  onChange={e=>setEditableTranscript(e.target.value)}
+                  onKeyDown={e=>e.key==="Enter"&&editableTranscript.trim()&&parseAndPay(editableTranscript)}
+                  style={{flex:1,background:"rgba(255,107,53,.06)",border:"1px solid rgba(255,107,53,.3)",color:"#F0EDE8",borderRadius:"10px",padding:"11px 14px",fontSize:"14px"}}
+                />
+                <button onClick={()=>editableTranscript.trim()&&parseAndPay(editableTranscript)}
+                  style={{background:"linear-gradient(135deg,#FF6B35,#F7931E)",border:"none",color:"#fff",borderRadius:"10px",padding:"11px 18px",fontSize:"14px",fontWeight:700,cursor:"pointer"}}>
+                  Send
+                </button>
+              </div>
             </div>
           )}
 
           {/* Status text */}
           <div style={{textAlign:"center",marginBottom:"20px",minHeight:"48px",width:"100%",animation:"fadeUp .3s ease"}}>
-            {phase==="idle"&&!textMode&&<p style={{color:"#444",fontSize:"14px",margin:0}}>Hold to speak · बोलने के लिए दबाएं</p>}
+            {phase==="idle"&&!textMode&&!waitingForSend&&<p style={{color:"#444",fontSize:"14px",margin:0}}>Tap mic to speak · बोलने के लिए दबाएं</p>}
             {phase==="listening"&&<>
               <p style={{color:"#FF6B35",fontSize:"14px",margin:"0 0 8px",fontWeight:600}}>सुन रहा हूँ…</p>
               {transcript&&<div style={{background:"rgba(255,107,53,.08)",border:"1px solid rgba(255,107,53,.15)",borderRadius:"14px",padding:"10px 18px",fontSize:"15px",maxWidth:"320px",margin:"0 auto"}}>"{transcript}"</div>}
